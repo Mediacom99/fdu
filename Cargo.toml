@@ -1,0 +1,34 @@
+[package]
+name = "fdu"
+version = "0.1.0"
+edition = "2024"
+authors = ["Edoardo Bertoli bertoliedoardo99@gmail.com"]
+description = "Crazy fast disk usage analyzer"
+license = "MIT OR Apache-2.0"
+repository = "TODO_ADD_GITHUB_LINK"
+keywords = ["disk", "usage", "du", "filesystem", "parallel"]
+categories = ["command-line-utilities", "filesystem"]
+
+[dependencies]
+anyhow = "1.0.98"
+crossbeam-channel = "0.5.15"
+crossbeam-deque = "0.8.6"
+crossbeam-utils = "0.8.21"
+humansize = "2.1.3"
+num_cpus = "1.17.0"
+
+# fastrace = { version = "0.7.14", features = ["enable"]}
+fastrace = { version = "0.7.14" }
+log = {version = "0.4.27", features = ["release_max_level_info"]}
+logforth = {version = "0.26.2", features = ["append-fastrace", "colored"]}
+
+[[bin]]
+name = "fdu"
+path = "src/fdu/main.rs"
+
+[profile.release]
+lto = true
+codegen-units = 1
+opt-level = 3
+strip = false
+debug = true
