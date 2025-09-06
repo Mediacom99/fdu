@@ -13,17 +13,22 @@ use std::{
     usize,
 };
 
-const STEAL_RETRIES: usize = 3;
-
 /// A directory path with its depth relative to root item
 pub struct Job {
     pub path: PathBuf,
+    pub parent: Option<PathBuf>,
     pub depth: usize,
+    pub is_dir: bool,
 }
 
 impl Job {
-    pub fn new(path: PathBuf, depth: usize) -> Self {
-        Self { path, depth }
+    pub fn new(path: PathBuf, parent: Option<PathBuf>, depth: usize, is_dir: bool) -> Self {
+        Self {
+            path,
+            parent,
+            depth,
+            is_dir,
+        }
     }
 }
 
@@ -185,14 +190,16 @@ impl WalkWorker {
                     match entry {
                         Ok(entry) => {
                             if let Some(ft) = entry.file_type().ok() {
-                                let new_job = Job::new(entry.path(), job.depth + 1);
+                                let parent = entry.path().parent().map(|p| p.to_path_buf());
+                                let mut new_job =
+                                    Job::new(entry.path(), parent, job.depth + 1, false);
                                 if ft.is_dir() {
                                     // Send to global queue or batch and then send
+                                    new_job.is_dir = true;
                                     self.injector.push(new_job);
                                     self.local_work_delta += 1;
                                 } else {
                                     self.files_processed += 1;
-                                    // println!("{}", job.path.display());
                                     match self.send_channel.send(new_job) {
                                         Ok(()) => {}
                                         Err(error) => {
@@ -214,7 +221,7 @@ impl WalkWorker {
                 }
             }
             Err(err) => {
-                log::warn!("Failed to read directory {:?}: {}", job.path, err);
+                // log::warn!("Failed to read directory {:?}: {}", job.path, err);
                 return Err(anyhow!(
                     "Failed to read directory {:?}, exiting job, err: {}",
                     job.path,

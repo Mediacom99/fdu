@@ -30,5 +30,5 @@ path = "src/fdu/main.rs"
 lto = true
 codegen-units = 1
 opt-level = 3
-strip = false
-debug = true
+strip = true
+debug = false
