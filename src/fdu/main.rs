@@ -1,13 +1,12 @@
 use anyhow::Result;
-use fdu::core::walker;
+use clap::Parser;
+use fastrace::collector::{Config, ConsoleReporter};
+use fdu::{cli, core::walker};
 use logforth::{
     append,
+    colored::Colorize,
     filter::{EnvFilter, env_filter::EnvFilterBuilder},
 };
-
-const NUM_WORKERS: usize = 12;
-const PATH: &str = "/home/mediacom";
-// const TRACE: bool = false;
 
 #[derive(Debug)]
 pub struct CustomTextLayout {}
@@ -23,21 +22,21 @@ impl logforth::layout::Layout for CustomTextLayout {
         record: &log::Record,
         _diagnostics: &[Box<dyn logforth::Diagnostic>],
     ) -> anyhow::Result<Vec<u8>> {
-        // let level_str = match record.level() {
-        //     log::Level::Error => "ERROR".red().bold(),
-        //     log::Level::Warn => "WARN".yellow().bold(),
-        //     log::Level::Info => "INFO".green().bold(),
-        //     log::Level::Debug => "DEBUG".blue().bold(),
-        //     log::Level::Trace => "TRACE".purple().bold(),
-        // };
-
         let level_str = match record.level() {
-            log::Level::Error => "ERROR",
-            log::Level::Warn => "WARN",
-            log::Level::Info => "INFO",
-            log::Level::Debug => "DEBUG",
-            log::Level::Trace => "TRACE",
+            log::Level::Error => "ERROR".red().bold(),
+            log::Level::Warn => "WARN".yellow().bold(),
+            log::Level::Info => "INFO".green().bold(),
+            log::Level::Debug => "DEBUG".blue().bold(),
+            log::Level::Trace => "TRACE".purple().bold(),
         };
+
+        // let level_str = match record.level() {
+        //     log::Level::Error => "ERROR",
+        //     log::Level::Warn => "WARN",
+        //     log::Level::Info => "INFO",
+        //     log::Level::Debug => "DEBUG",
+        //     log::Level::Trace => "TRACE",
+        // };
 
         // let origin_source_file = record.target();
 
@@ -47,7 +46,9 @@ impl logforth::layout::Layout for CustomTextLayout {
 }
 
 fn main() -> Result<()> {
-    // if TRACE {
+    let cli = cli::Cli::parse();
+
+    // if cli.trace {
     //     fastrace::set_reporter(ConsoleReporter, Config::default());
     // }
 
@@ -65,17 +66,15 @@ fn main() -> Result<()> {
             let dispatch = d
                 .filter(EnvFilter::new(filter_builder))
                 .append(append::Stderr::default().with_layout(CustomTextLayout::new()));
-            // if TRACE {
+            // if cli.trace {
             //     dispatch = dispatch.append(append::FastraceEvent::default());
             // }
             dispatch
         })
         .apply();
 
-    let multi_walker = walker::Multithreaded::new(NUM_WORKERS);
-    log::info!("Walker started walking...");
-    multi_walker.walk(PATH.into())?;
-    log::info!("Walker finished!");
+    let multi_walker = walker::Multithreaded::new(cli.threads);
+    multi_walker.walk(cli.paths[0].clone())?;
 
     fastrace::flush();
     Ok(())

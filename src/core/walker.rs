@@ -13,7 +13,7 @@ use anyhow::{Ok, Result, anyhow};
 use crossbeam_deque::{Injector, Stealer, Worker};
 use crossbeam_utils::thread::ScopedJoinHandle;
 
-const CHANNEL_ITEMS: usize = 256;
+const CHANNEL_ITEMS: usize = 512;
 
 pub struct Multithreaded {
     num_threads: usize,
@@ -75,7 +75,7 @@ impl Multithreaded {
                 );
                 let termination = termination.clone();
                 let worker_handle = s.spawn(move |_| walk_walker.run_loop(termination));
-                let processing_handle = s.spawn(move |_| process_worker(recv_channel));
+                let processing_handle = s.spawn(move |_| process_worker(id, recv_channel));
                 handles.push(worker_handle);
                 proc_handles.push(processing_handle);
             }
@@ -105,35 +105,37 @@ impl Multithreaded {
     }
 }
 
-fn process_worker(recv_channel: Receiver<Job>) -> Result<u64> {
-    let mut biggest_path: Option<PathBuf> = None;
-    let mut biggest_size: u64 = 0;
+fn process_worker(id: usize, recv_channel: Receiver<Job>) -> Result<u64> {
+    // let mut biggest_path: Option<PathBuf> = None;
+    // let mut biggest_size: u64 = 0;
     let mut total_size: u64 = 0;
 
     let mut job_iter = recv_channel.iter();
 
     loop {
-        let batch_jobs: Vec<Job> = job_iter.by_ref().take(CHANNEL_ITEMS).collect();
+        let job_buffer: Vec<Job> = job_iter.by_ref().take(CHANNEL_ITEMS).collect();
+        log::trace!("Processor {} started on job buffer", id);
 
-        if batch_jobs.is_empty() {
+        if job_buffer.is_empty() {
+            log::trace!("Empty jobs buffer, exiting processing loop...");
             break;
         }
 
-        batch_jobs.iter().for_each(|job| {
+        job_buffer.iter().for_each(|job| {
             match job.path.symlink_metadata() {
                 Result::Ok(metadata) => {
                     if !is_special_file(&metadata.file_type()) {
                         let entry_size = metadata.blocks() * 512;
                         total_size += entry_size;
-                        if entry_size > biggest_size {
-                            biggest_size = entry_size;
-                            biggest_path = Some(job.path.clone());
-                        }
+                        // if entry_size > biggest_size {
+                        //     biggest_size = entry_size;
+                        //     biggest_path = Some(job.path.clone());
+                        // }
                     }
                 }
                 Err(err) => {
                     log::warn!(
-                        "Failed to read file metadata for file: {}, error: {}",
+                        "Failed to read metadata for file: {}, error: {}",
                         job.path.display(),
                         err
                     );
@@ -141,13 +143,13 @@ fn process_worker(recv_channel: Receiver<Job>) -> Result<u64> {
             };
         });
     }
-    if let Some(path) = biggest_path {
-        println!(
-            "Biggest file found: {}, size in bytes: {}",
-            path.display(),
-            humansize::format_size(biggest_size, humansize::DECIMAL)
-        );
-    }
+    // if let Some(path) = biggest_path {
+    //     println!(
+    //         "Size: {}\n\tpath:{}",
+    //         humansize::format_size(biggest_size, humansize::DECIMAL),
+    //         path.display()
+    //     );
+    // }
     Ok(total_size)
 }
 

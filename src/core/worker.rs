@@ -111,21 +111,34 @@ impl WalkWorker {
                 //Pop from local
                 .inner
                 .pop()
+                .inspect(|task| {
+                    log::trace!(
+                        "Worker {} popped task from local queue: {}",
+                        self.id,
+                        task.path.display()
+                    )
+                })
                 // Or steal from global queue equally between workers
                 .or_else(|| {
                     std::iter::repeat_with(|| {
-                        self.injector
-                            .steal_batch_and_pop(
-                                &self.inner,
-                                // (&self.injector.len() / self.num_workers).max(1),
-                            )
-                            //Try stealing a task from other thread
-                            .or_else(|| self.stealers.iter().map(|s| s.steal()).collect())
+                        let global_steal = self.injector.steal_batch_and_pop(
+                            &self.inner,
+                            // (&self.injector.len() / self.num_workers).max(1),
+                        );
+                        if global_steal.is_success() {
+                            log::trace!("Worker {} stole from global queue", self.id);
+                        }
+                        //Try stealing a task from other thread
+                        let direct_steal = global_steal
+                            .or_else(|| self.stealers.iter().map(|s| s.steal()).collect());
+                        if direct_steal.is_success() {
+                            log::trace!("Worker {} stole from victim thread", self.id);
+                        }
+                        direct_steal
                     })
                     .find(|s| !s.is_retry())
                     .and_then(|s| return s.success())
                 });
-            //Or steal from busiest worker
 
             match task {
                 Some(item) => {
@@ -139,18 +152,20 @@ impl WalkWorker {
                     //it must finish because at worst the work is distributed perfectly
                     //and they sync only at the end
 
-                    termination.fetch_add(self.local_work_delta, Ordering::AcqRel);
-                    self.local_work_delta = 0;
+                    if idle_cycles % 100 == 0 {
+                        termination.fetch_add(self.local_work_delta, Ordering::AcqRel);
+                        self.local_work_delta = 0;
 
-                    if termination.load(Ordering::Acquire) == 0 {
-                        log::trace!(
-                            "Worker #{} terminating: dirs: {}, files: {}, errors: {}",
-                            self.id,
-                            self.dirs_processed,
-                            self.files_processed,
-                            self.errors_count,
-                        );
-                        break;
+                        if termination.load(Ordering::Acquire) == 0 {
+                            log::trace!(
+                                "Worker #{} terminating: dirs: {}, files: {}, errors: {}",
+                                self.id,
+                                self.dirs_processed,
+                                self.files_processed,
+                                self.errors_count,
+                            );
+                            break;
+                        }
                     }
 
                     // Exponential backoff
