@@ -1,6 +1,5 @@
 use anyhow::Result;
 use clap::Parser;
-use fastrace::collector::{Config, ConsoleReporter};
 use fdu::{cli, core::walker};
 use logforth::{
     append,

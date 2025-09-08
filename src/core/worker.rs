@@ -1,15 +1,14 @@
 use anyhow::anyhow;
-use crossbeam_channel::Sender;
 use crossbeam_deque::{Injector, Stealer, Worker};
 use fastrace::prelude::*;
 use std::{
     fs::{self},
+    os::unix::fs::{FileTypeExt, MetadataExt},
     path::PathBuf,
     sync::{
         Arc,
         atomic::{AtomicI64, Ordering},
     },
-    time::Duration,
     usize,
 };
 
@@ -19,6 +18,18 @@ pub struct Job {
     pub parent: Option<PathBuf>,
     pub depth: usize,
     pub is_dir: bool,
+}
+
+pub struct WorkerResult {
+    pub total_blocks: u64,
+}
+
+impl WorkerResult {
+    pub fn new(worker: &WalkWorker) -> Self {
+        Self {
+            total_blocks: worker.total_blocks,
+        }
+    }
 }
 
 impl Job {
@@ -50,8 +61,6 @@ pub struct WalkWorker {
     follow_symlinks: bool,
     max_depth: Option<usize>,
 
-    send_channel: Sender<Job>,
-
     /// Local work delta (work produced - work consumed)
     /// TODO: this is what I have to sync globally when idle
     /// syncing means I set the add to global_count the local_delta
@@ -63,6 +72,9 @@ pub struct WalkWorker {
     dirs_processed: usize,
     files_processed: usize,
     errors_count: usize,
+
+    /// Data that can be calculated walking
+    total_blocks: u64,
 }
 
 impl WalkWorker {
@@ -74,7 +86,6 @@ impl WalkWorker {
         num_threads: usize,
         follow_symlinks: bool,
         max_depth: Option<usize>,
-        send_channel: Sender<Job>,
     ) -> Self {
         Self {
             id,
@@ -84,15 +95,15 @@ impl WalkWorker {
             num_workers: num_threads,
             follow_symlinks,
             max_depth,
-            send_channel,
             local_work_delta: 0,
             dirs_processed: 0,
             files_processed: 0,
             errors_count: 0,
+            total_blocks: 0,
         }
     }
 
-    pub fn run_loop(&mut self, termination: Arc<AtomicI64>) -> anyhow::Result<()> {
+    pub fn run_loop(&mut self, termination: Arc<AtomicI64>) -> anyhow::Result<WorkerResult> {
         // Setup fastrace span for this function
 
         #[cfg(debug_assertions)]
@@ -152,35 +163,41 @@ impl WalkWorker {
                     //it must finish because at worst the work is distributed perfectly
                     //and they sync only at the end
 
-                    if idle_cycles % 100 == 0 {
-                        termination.fetch_add(self.local_work_delta, Ordering::AcqRel);
-                        self.local_work_delta = 0;
-
-                        if termination.load(Ordering::Acquire) == 0 {
-                            log::trace!(
-                                "Worker #{} terminating: dirs: {}, files: {}, errors: {}",
-                                self.id,
-                                self.dirs_processed,
-                                self.files_processed,
-                                self.errors_count,
-                            );
-                            break;
-                        }
+                    if self.inner.is_empty()
+                        && self.injector.is_empty()
+                        && self.stealers.iter().all(|s| s.len() == 0)
+                    {
+                        break;
                     }
+                    std::thread::yield_now();
 
-                    // Exponential backoff
-                    idle_cycles += 1;
-                    if idle_cycles < 10 {
-                        std::hint::spin_loop();
-                    } else if idle_cycles < 100 {
-                        std::thread::yield_now();
-                    } else {
-                        std::thread::sleep(Duration::from_micros(10));
-                    }
+                    // if idle_cycles % 100 == 0 {
+                    //     termination.fetch_add(self.local_work_delta, Ordering::AcqRel);
+                    //     self.local_work_delta = 0;
+                    //
+                    //     if termination.load(Ordering::Acquire) == 0 {
+                    //         log::trace!(
+                    //             "Worker #{} terminating: dirs: {}, files: {}, errors: {}",
+                    //             self.id,
+                    //             self.dirs_processed,
+                    //             self.files_processed,
+                    //             self.errors_count,
+                    //         );
+                    //         break;
+                    //     }
+                    // }
+                    //
+                    // // Exponential backoff
+                    // idle_cycles += 1;
+                    // if idle_cycles < 10 {
+                    //     std::hint::spin_loop();
+                    // } else if idle_cycles < 100 {
+                    //     std::thread::yield_now();
+                    // }
                 }
             }
         }
-        Ok(())
+        anyhow::Ok(WorkerResult::new(&self))
     }
 
     //TODO: update to use only two worker-local buffers:
@@ -190,13 +207,20 @@ impl WalkWorker {
         // Check max depth
         if let Some(max) = self.max_depth {
             if job.depth > max {
-                return Ok(());
+                return anyhow::Ok(());
             }
         }
 
         // Consume a job from queue
         self.local_work_delta -= 1;
         self.dirs_processed += 1;
+
+        // Short path if root is file
+        if !job.is_dir {
+            self.files_processed += 1;
+            self.process_file(&job)?;
+            return anyhow::Ok(());
+        }
 
         // Read entries
         match fs::read_dir(&job.path) {
@@ -215,16 +239,7 @@ impl WalkWorker {
                                     self.local_work_delta += 1;
                                 } else {
                                     self.files_processed += 1;
-                                    match self.send_channel.send(new_job) {
-                                        Ok(()) => {}
-                                        Err(error) => {
-                                            log::trace!(
-                                                "Worker #{}: Channel receiver error: {}",
-                                                self.id,
-                                                error
-                                            );
-                                        }
-                                    };
+                                    self.process_file(&new_job)?;
                                 }
                             }
                         }
@@ -245,6 +260,32 @@ impl WalkWorker {
             }
         }
 
-        Ok(())
+        anyhow::Ok(())
     }
+
+    fn process_file(&mut self, job: &Job) -> anyhow::Result<()> {
+        match job.path.symlink_metadata() {
+            Result::Ok(metadata) => {
+                if !is_special_file(&metadata.file_type()) {
+                    self.total_blocks += metadata.blocks();
+                }
+            }
+            Err(err) => {
+                log::warn!(
+                    "Failed to read metadata for file: {}, error: {}",
+                    job.path.display(),
+                    err
+                );
+            }
+        };
+        anyhow::Ok(())
+    }
+}
+
+fn is_special_file(file_type: &fs::FileType) -> bool {
+    file_type.is_block_device()
+        || file_type.is_char_device()
+        || file_type.is_fifo()
+        || file_type.is_socket()
+        || file_type.is_symlink()
 }
