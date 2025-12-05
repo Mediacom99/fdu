@@ -1,5 +1,7 @@
 test-data-large
 test-data
+scripts
+results
 target
 *.pdf
 prova
