@@ -151,7 +151,12 @@ impl WalkWorker {
     /// Try stealing from other workers' queues
     fn steal_from_victims(&self) -> Option<Job> {
         // Try each worker's queue in sequence
-        for stealer in self.stealers.iter() {
+        for (i, stealer) in self.stealers.iter().enumerate() {
+            // Skip stealing from self
+            if i == self.id {
+                continue;
+            }
+
             match stealer.steal() {
                 Steal::Success(job) => {
                     log::trace!("Worker {} stole from victim", self.id);
@@ -265,7 +270,6 @@ impl WalkWorker {
 
         // Consume a job from the queue
         self.local_work_delta -= 1;
-        self.dirs_processed += 1;
 
         // Short path if root is a file
         if !job.is_dir {
@@ -273,6 +277,8 @@ impl WalkWorker {
             self.process_file(&job)?;
             return anyhow::Ok(());
         }
+
+        self.dirs_processed += 1;
 
         // Read entries
         match fs::read_dir(&job.path) {
@@ -304,7 +310,8 @@ impl WalkWorker {
             }
             Err(err) => {
                 return Err(anyhow!(
-                    "Failed to read directory {:?}, exiting job, err: {}",
+                    "Worker {} failed to read directory {:?}: {}",
+                    self.id,
                     job.path,
                     err
                 ));
