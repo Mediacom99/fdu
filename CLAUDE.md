@@ -2,6 +2,16 @@
 
 This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
 
+## Role and Workflow
+
+**IMPORTANT:** Claude Code acts as a **code reviewer and advisor** for this project. The user writes the code, and Claude:
+- Reviews code for correctness, performance, and best practices
+- Provides technical analysis and recommendations
+- Evaluates design tradeoffs and alternative approaches
+- Answers questions about architecture and implementation details
+
+**DO NOT write or modify code unless explicitly requested by the user.**
+
 ## Important: Read Documentation First
 
 **Before starting work, read these documentation files:**
