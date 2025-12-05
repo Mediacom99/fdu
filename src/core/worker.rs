@@ -60,10 +60,10 @@ pub struct WalkWorker {
     max_depth: Option<usize>,
 
     /// Local work delta (work produced - work consumed)
-    /// TODO: this is what I have to sync globally when idle
-    /// syncing means I set the add to global_count the local_delta
-    /// and I set the local_delta to zero
-    /// The global counter is zero only when each worker has no net work coming out of it
+    /// This is what has to be synced globally when idle.
+    /// Syncing means adding to global_count the local_delta
+    /// and setting the local_delta to zero.
+    /// The global counter is zero only when each worker has no net work coming out of it.
     local_work_delta: i64,
 
     /// Statistics
@@ -103,7 +103,7 @@ impl WalkWorker {
 
     /// Try to get work: local queue -> global queue -> steal from victims
     fn find_work(&self) -> Option<Job> {
-        // 1. Try popping from local queue first (fastest path)
+        // 1. Try popping from the local queue first (the fastest path)
         if let Some(job) = self.inner.pop() {
             log::trace!(
                 "Worker {} popped from local queue: {}",
@@ -200,10 +200,10 @@ impl WalkWorker {
         loop {
             // Try to find work using the three-tier strategy
             match self.find_work() {
-                Some(item) => {
+                Some(job) => {
                     idle_cycles = 0; // Reset idle counter
 
-                    if let Err(_) = self.process_job(&item) {
+                    if let Err(_) = self.process_job(&job) {
                         self.errors_count += 1;
                     }
                 }
@@ -268,13 +268,11 @@ impl WalkWorker {
         // Consume a job from the queue
         self.local_work_delta -= 1;
 
-        // Short path if root is a file
+        // Short path if the root path is a file
         if !job.is_dir {
             self.files_processed += 1;
              return self.process_file(&job);
         }
-
-        self.dirs_processed += 1;
 
         // Read entries
         match fs::read_dir(&job.path) {
@@ -293,7 +291,7 @@ impl WalkWorker {
                                     self.local_work_delta += 1;
                                 } else {
                                     self.files_processed += 1;
-                                    if let Err(_)= self.process_file(&new_job) {
+                                    if let Err(_) = self.process_file(&new_job) {
                                         self.errors_count += 1;
                                     }
                                 }
@@ -305,13 +303,14 @@ impl WalkWorker {
                         }
                     }
                 }
+                self.dirs_processed += 1;
+                anyhow::Ok(())
             }
             Err(err) => {
                 log::error!("Worker {} failed to open directory {}: {}", self.id, job.path.display(), err);
-                return Err(err.into());
+                Err(err.into())
             }
         }
-        anyhow::Ok(())
     }
 
     fn process_file(&mut self, job: &Job) -> Result<(), anyhow::Error>{
@@ -320,6 +319,7 @@ impl WalkWorker {
                 if !is_special_file(&metadata.file_type()) {
                     self.total_blocks += metadata.blocks();
                 }
+                anyhow::Ok(())
             }
             Err(err) => {
                 log::error!(
@@ -328,10 +328,9 @@ impl WalkWorker {
                     job.path.display(),
                     err
                 );
-                return Err(err.into());
+                Err(err.into())
             }
-        };
-        anyhow::Ok(())
+        }
     }
 }
 
