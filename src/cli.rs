@@ -86,7 +86,7 @@ pub struct Cli {
     pub one_file_system: bool,
 
     /// Number of threads
-    #[arg(short = 'j', long, default_value = "32")]
+    #[arg(short = 'j', long = "jobs", default_value = "32")]
     pub threads: usize,
 
     /// Cache size in MB (for hard links)

@@ -19,7 +19,7 @@ num_cpus = "1.17.0"
 
 # fastrace = { version = "0.7.14", features = ["enable"]}
 fastrace = { version = "0.7.14" }
-log = {version = "0.4.27", features = ["release_max_level_info"]}
+log = {version = "0.4.27", features = ["release_max_level_trace"]}
 logforth = {version = "0.26.2", features = ["append-fastrace", "colored"]}
 clap = { version = "4.5.47", features = ["derive"] }
 regex = "1.11.2"

@@ -46,11 +46,6 @@ impl logforth::layout::Layout for CustomTextLayout {
 
 fn main() -> Result<()> {
     let cli = cli::Cli::parse();
-
-    // if cli.trace {
-    //     fastrace::set_reporter(ConsoleReporter, Config::default());
-    // }
-
     let filter_builder = EnvFilterBuilder::try_from_env("FDU_LOG").unwrap_or_else(|| {
         let default_level = if cfg!(debug_assertions) {
             log::LevelFilter::Debug
@@ -72,9 +67,9 @@ fn main() -> Result<()> {
         })
         .apply();
 
+    log::info!("Starting fdu v{}, threads: {}", env!("CARGO_PKG_VERSION"), cli.threads);
     let multi_walker = walker::Multithreaded::new(cli.threads);
     multi_walker.walk(cli.paths[0].clone())?;
-
     fastrace::flush();
     Ok(())
 }

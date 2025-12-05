@@ -1,5 +1,5 @@
 use anyhow::anyhow;
-use crossbeam_deque::{Injector, Stealer, Worker};
+use crossbeam_deque::{Injector, Steal, Stealer, Worker};
 use fastrace::prelude::*;
 use std::{
     fs::{self},
@@ -102,6 +102,85 @@ impl WalkWorker {
         }
     }
 
+    /// Try to get work: local queue -> global queue -> steal from victims
+    fn find_work(&self) -> Option<Job> {
+        // 1. Try popping from local queue first (fastest path)
+        if let Some(job) = self.inner.pop() {
+            log::trace!(
+                "Worker {} popped from local queue: {}",
+                self.id,
+                job.path.display()
+            );
+            return Some(job);
+        }
+
+        // 2. Try stealing from the global queue with an adaptive batch size
+        if let Some(job) = self.steal_from_global() {
+            return Some(job);
+        }
+
+        // 3. Try stealing from other workers
+        self.steal_from_victims()
+    }
+
+    /// Steal from the global queue with adaptive batching
+    fn steal_from_global(&self) -> Option<Job> {
+        // Calculate a fair batch size based on queue length
+        let batch_size = (self.injector.len() / self.num_workers)
+            .max(1)   // Always try to steal at least 1
+            .min(32); // Cap at 32 to avoid hogging
+
+        loop {
+            match self.injector.steal_batch_with_limit_and_pop(&self.inner, batch_size) {
+                Steal::Success(job) => {
+                    log::trace!("Worker {} stole batch from global queue", self.id);
+                    return Some(job);
+                }
+                Steal::Empty => {
+                    // Global queue is definitely empty
+                    return None;
+                }
+                Steal::Retry => {
+                    // Race condition detected, retry immediately
+                    continue;
+                }
+            }
+        }
+    }
+
+    /// Try stealing from other workers' queues
+    fn steal_from_victims(&self) -> Option<Job> {
+        // Try each worker's queue in sequence
+        for stealer in self.stealers.iter() {
+            match stealer.steal() {
+                Steal::Success(job) => {
+                    log::trace!("Worker {} stole from victim", self.id);
+                    return Some(job);
+                }
+                Steal::Empty => {
+                    // This victim has nothing, try next
+                    continue;
+                }
+                Steal::Retry => {
+                    // Race condition, try the next victim
+                    // (could retry the same victim, but trying next is simpler)
+                    continue;
+                }
+            }
+        }
+        // All victims were empty or had races
+        None
+    }
+
+    /// Check if this worker should terminate
+    #[inline]
+    fn should_terminate(&self, global_job_counter: &Arc<AtomicI64>) -> bool {
+        global_job_counter.load(Ordering::Acquire) == 0
+            && self.inner.is_empty()
+            && self.injector.is_empty()
+            && self.stealers.iter().all(|s| s.len() == 0)
+    }
+
     pub fn run_loop(&mut self, global_job_counter: Arc<AtomicI64>) -> anyhow::Result<WorkerResult> {
         // Setup fastrace span for this function
 
@@ -116,80 +195,59 @@ impl WalkWorker {
         let mut idle_cycles = 0;
 
         loop {
-            //Get work with new strategy
-            let task = self
-                //Pop from local
-                .inner
-                .pop()
-                .inspect(|task| {
-                    log::trace!(
-                        "Worker {} popped task from local queue: {}",
-                        self.id,
-                        task.path.display()
-                    )
-                })
-                // Or steal from the global queue equally between workers
-                .or_else(|| {
-                    std::iter::repeat_with(|| {
-                        let global_steal = self.injector.steal_batch_and_pop(
-                            &self.inner,
-                            // (&self.injector.len() / self.num_workers).max(1),
-                        );
-                        if global_steal.is_success() {
-                            log::trace!("Worker {} stole from global queue", self.id);
-                        }
-                        //Try stealing a task from another thread
-                        let direct_steal = global_steal
-                            .or_else(|| self.stealers.iter().map(|s| s.steal()).collect());
-                        if direct_steal.is_success() {
-                            log::trace!("Worker {} stole from victim thread", self.id);
-                        }
-                        direct_steal
-                    })
-                    .find(|s| !s.is_retry())
-                    .and_then(|s| return s.success())
-                });
-
-            match task {
+            // Try to find work using the three-tier strategy
+            match self.find_work() {
                 Some(item) => {
-                    idle_cycles = 0;
+                    idle_cycles = 0; // Reset idle counter
+
                     if let Err(_) = self.process_job(&item) {
                         self.errors_count += 1;
-                    };
+                    }
                 }
                 None => {
+                    // No work found, enter an exponential backoff sequence
                     idle_cycles += 1;
-                    if idle_cycles < 10 {
-                        //SPIN: light spinning for 10 cycles, maybe there will be a burst of work from other thread
-                        std::hint::spin_loop();
-                        continue;
-                    } else if idle_cycles < 1000 {
-                        //YIELD: because work might appear soon but not instantly, give timeslice to scheduler
-                        std::thread::yield_now();
-                        continue;
-                    } else if idle_cycles == 1000 {
-                        //SYNC: local work delta with global counter after 1000 cycles we're probably near termination
-                        if self.local_work_delta != 0 {
-                            global_job_counter.fetch_add(self.local_work_delta, Ordering::AcqRel);
-                            self.local_work_delta = 0;
+
+                    match idle_cycles {
+                        // Phase 1: Light spinning (1-9 cycles)
+                        1..=9 => {
+                            std::hint::spin_loop();
                         }
-                        continue;
-                    } else if idle_cycles < 5000 { //keep yielding and check for work
-                        //WAIT
-                        //Final termination check, keep yielding and check for work
-                        std::thread::yield_now();
-                        continue;
-                    } else {
-                        //TERMINATE
-                        //Final termination check
-                        if global_job_counter.load(Ordering::Acquire) == 0
-                            && self.inner.is_empty() //the local queue is empty
-                            && self.injector.is_empty() //the global queue is empty
-                            && self.stealers.iter().all(|s| s.len() == 0) { //stealers are empty
-                            break;
+                        // Phase 2: Yielding to scheduler (10-999 cycles)
+                        10..=999 => {
+                            std::thread::yield_now();
                         }
-                        idle_cycles = 1001; //stay in the synced phase
-                        continue;
+                        // Phase 3: Sync local work delta (at cycle 1000)
+                        1000 => {
+                            if self.local_work_delta != 0 {
+                                global_job_counter.fetch_add(
+                                    self.local_work_delta,
+                                    Ordering::AcqRel
+                                );
+                                self.local_work_delta = 0;
+                            }
+                            std::thread::yield_now();
+                        }
+                        // Phase 4: Keep waiting (1001-4999 cycles)
+                        1001..=4999 => {
+                            std::thread::yield_now();
+                        }
+                        // Phase 5: Final termination check (5000+ cycles)
+                        _ => {
+                            if self.should_terminate(&global_job_counter) {
+                                log::trace!(
+                                    "Worker {} terminating: dirs={}, files={}, errors={}",
+                                    self.id,
+                                    self.dirs_processed,
+                                    self.files_processed,
+                                    self.errors_count
+                                );
+                                break;
+                            }
+                            // Reset to stay in the synced phase
+                            idle_cycles = 1001;
+                            std::thread::yield_now();
+                        }
                     }
                 }
             }
@@ -197,9 +255,6 @@ impl WalkWorker {
         anyhow::Ok(WorkerResult::new(&self))
     }
 
-    //TODO: update to use only two worker-local buffers:
-    //1. current_work_item_buffer: used to construct work item from entries
-    //2. work_items_buffer: buffer that holds new WorkItems to distribute
     fn process_job(&mut self, job: &Job) -> anyhow::Result<()> {
         // Check max depth
         if let Some(max) = self.max_depth {
@@ -208,11 +263,11 @@ impl WalkWorker {
             }
         }
 
-        // Consume a job from queue
+        // Consume a job from the queue
         self.local_work_delta -= 1;
         self.dirs_processed += 1;
 
-        // Short path if root is file
+        // Short path if root is a file
         if !job.is_dir {
             self.files_processed += 1;
             self.process_file(&job)?;
@@ -248,7 +303,6 @@ impl WalkWorker {
                 }
             }
             Err(err) => {
-                // log::warn!("Failed to read directory {:?}: {}", job.path, err);
                 return Err(anyhow!(
                     "Failed to read directory {:?}, exiting job, err: {}",
                     job.path,
@@ -256,13 +310,12 @@ impl WalkWorker {
                 ));
             }
         }
-
         anyhow::Ok(())
     }
 
     fn process_file(&mut self, job: &Job) -> anyhow::Result<()> {
         match job.path.symlink_metadata() {
-            Result::Ok(metadata) => {
+            Ok(metadata) => {
                 if !is_special_file(&metadata.file_type()) {
                     self.total_blocks += metadata.blocks();
                 }
