@@ -11,7 +11,7 @@ use std::{
     },
 };
 
-/// A directory path with its depth relative to root item
+/// A directory path with its depth relative to the root item
 pub struct Job {
     pub path: PathBuf,
     pub parent: Option<PathBuf>,
@@ -235,7 +235,7 @@ impl WalkWorker {
                         // Phase 5: Final termination check (5000+ cycles)
                         _ => {
                             if self.should_terminate(&global_job_counter) {
-                                log::trace!(
+                                log::info!(
                                     "Worker {} terminating: dirs={}, files={}, errors={}",
                                     self.id,
                                     self.dirs_processed,
