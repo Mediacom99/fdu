@@ -1,4 +1,3 @@
-use anyhow::anyhow;
 use crossbeam_deque::{Injector, Steal, Stealer, Worker};
 use fastrace::prelude::*;
 use std::{
@@ -188,7 +187,6 @@ impl WalkWorker {
 
     pub fn run_loop(&mut self, global_job_counter: Arc<AtomicI64>) -> anyhow::Result<WorkerResult> {
         // Setup fastrace span for this function
-
         #[cfg(debug_assertions)]
         let (_worker_span, _guard) = {
             let worker_span = Span::root("worker_loop", SpanContext::random());
@@ -212,7 +210,6 @@ impl WalkWorker {
                 None => {
                     // No work found, enter an exponential backoff sequence
                     idle_cycles += 1;
-
                     match idle_cycles {
                         // Phase 1: Light spinning (1-9 cycles)
                         1..=9 => {
@@ -260,11 +257,11 @@ impl WalkWorker {
         anyhow::Ok(WorkerResult::new(&self))
     }
 
-    fn process_job(&mut self, job: &Job) -> anyhow::Result<()> {
+    fn process_job(&mut self, job: &Job) -> anyhow::Result<(), anyhow::Error> {
         // Check max depth
         if let Some(max) = self.max_depth {
             if job.depth > max {
-                return anyhow::Ok(());
+                return Err(anyhow::anyhow!("Worker {} has reached max depth: {} > {}", self.id, job.depth, max));
             }
         }
 
@@ -274,8 +271,7 @@ impl WalkWorker {
         // Short path if root is a file
         if !job.is_dir {
             self.files_processed += 1;
-            self.process_file(&job)?;
-            return anyhow::Ok(());
+             return self.process_file(&job);
         }
 
         self.dirs_processed += 1;
@@ -297,30 +293,28 @@ impl WalkWorker {
                                     self.local_work_delta += 1;
                                 } else {
                                     self.files_processed += 1;
-                                    self.process_file(&new_job)?;
+                                    if let Err(_)= self.process_file(&new_job) {
+                                        self.errors_count += 1;
+                                    }
                                 }
                             }
                         }
                         Err(err) => {
                             self.errors_count += 1;
-                            log::warn!("Failed to read directory entry, skipping: {}", err)
+                            log::error!("Worker {} failed to read directory entry, skipping: {}", self.id, err);
                         }
                     }
                 }
             }
             Err(err) => {
-                return Err(anyhow!(
-                    "Worker {} failed to read directory {:?}: {}",
-                    self.id,
-                    job.path,
-                    err
-                ));
+                log::error!("Worker {} failed to open directory {}: {}", self.id, job.path.display(), err);
+                return Err(err.into());
             }
         }
         anyhow::Ok(())
     }
 
-    fn process_file(&mut self, job: &Job) -> anyhow::Result<()> {
+    fn process_file(&mut self, job: &Job) -> Result<(), anyhow::Error>{
         match job.path.symlink_metadata() {
             Ok(metadata) => {
                 if !is_special_file(&metadata.file_type()) {
@@ -328,11 +322,13 @@ impl WalkWorker {
                 }
             }
             Err(err) => {
-                log::warn!(
-                    "Failed to read metadata for file: {}, error: {}",
+                log::error!(
+                    "Worker {} failed to read metadata for file: {}, error: {}",
+                    self.id,
                     job.path.display(),
                     err
                 );
+                return Err(err.into());
             }
         };
         anyhow::Ok(())

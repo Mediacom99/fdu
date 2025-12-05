@@ -50,7 +50,7 @@ fn main() -> Result<()> {
         let default_level = if cfg!(debug_assertions) {
             log::LevelFilter::Debug
         } else {
-            log::LevelFilter::Warn
+            log::LevelFilter::Info
         };
         EnvFilterBuilder::new().filter_level(default_level)
     });
