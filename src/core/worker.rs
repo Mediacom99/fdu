@@ -9,7 +9,6 @@ use std::{
         Arc,
         atomic::{AtomicI64, Ordering},
     },
-    usize,
 };
 
 /// A directory path with its depth relative to root item
@@ -103,7 +102,7 @@ impl WalkWorker {
         }
     }
 
-    pub fn run_loop(&mut self, termination: Arc<AtomicI64>) -> anyhow::Result<WorkerResult> {
+    pub fn run_loop(&mut self, global_job_counter: Arc<AtomicI64>) -> anyhow::Result<WorkerResult> {
         // Setup fastrace span for this function
 
         #[cfg(debug_assertions)]
@@ -129,7 +128,7 @@ impl WalkWorker {
                         task.path.display()
                     )
                 })
-                // Or steal from global queue equally between workers
+                // Or steal from the global queue equally between workers
                 .or_else(|| {
                     std::iter::repeat_with(|| {
                         let global_steal = self.injector.steal_batch_and_pop(
@@ -139,7 +138,7 @@ impl WalkWorker {
                         if global_steal.is_success() {
                             log::trace!("Worker {} stole from global queue", self.id);
                         }
-                        //Try stealing a task from other thread
+                        //Try stealing a task from another thread
                         let direct_steal = global_steal
                             .or_else(|| self.stealers.iter().map(|s| s.steal()).collect());
                         if direct_steal.is_success() {
@@ -159,41 +158,39 @@ impl WalkWorker {
                     };
                 }
                 None => {
-                    //TODO: Here I sync local worker load with global counter
-                    //it must finish because at worst the work is distributed perfectly
-                    //and they sync only at the end
-
-                    if self.inner.is_empty()
-                        && self.injector.is_empty()
-                        && self.stealers.iter().all(|s| s.len() == 0)
-                    {
-                        break;
+                    idle_cycles += 1;
+                    if idle_cycles < 10 {
+                        //SPIN: light spinning for 10 cycles, maybe there will be a burst of work from other thread
+                        std::hint::spin_loop();
+                        continue;
+                    } else if idle_cycles < 1000 {
+                        //YIELD: because work might appear soon but not instantly, give timeslice to scheduler
+                        std::thread::yield_now();
+                        continue;
+                    } else if idle_cycles == 1000 {
+                        //SYNC: local work delta with global counter after 1000 cycles we're probably near termination
+                        if self.local_work_delta != 0 {
+                            global_job_counter.fetch_add(self.local_work_delta, Ordering::AcqRel);
+                            self.local_work_delta = 0;
+                        }
+                        continue;
+                    } else if idle_cycles < 5000 { //keep yielding and check for work
+                        //WAIT
+                        //Final termination check, keep yielding and check for work
+                        std::thread::yield_now();
+                        continue;
+                    } else {
+                        //TERMINATE
+                        //Final termination check
+                        if global_job_counter.load(Ordering::Acquire) == 0
+                            && self.inner.is_empty() //the local queue is empty
+                            && self.injector.is_empty() //the global queue is empty
+                            && self.stealers.iter().all(|s| s.len() == 0) { //stealers are empty
+                            break;
+                        }
+                        idle_cycles = 1001; //stay in the synced phase
+                        continue;
                     }
-                    std::thread::yield_now();
-
-                    // if idle_cycles % 100 == 0 {
-                    //     termination.fetch_add(self.local_work_delta, Ordering::AcqRel);
-                    //     self.local_work_delta = 0;
-                    //
-                    //     if termination.load(Ordering::Acquire) == 0 {
-                    //         log::trace!(
-                    //             "Worker #{} terminating: dirs: {}, files: {}, errors: {}",
-                    //             self.id,
-                    //             self.dirs_processed,
-                    //             self.files_processed,
-                    //             self.errors_count,
-                    //         );
-                    //         break;
-                    //     }
-                    // }
-                    //
-                    // // Exponential backoff
-                    // idle_cycles += 1;
-                    // if idle_cycles < 10 {
-                    //     std::hint::spin_loop();
-                    // } else if idle_cycles < 100 {
-                    //     std::thread::yield_now();
-                    // }
                 }
             }
         }

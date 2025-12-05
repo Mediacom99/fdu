@@ -1,7 +1,6 @@
 use std::{
     path::PathBuf,
     sync::{Arc, atomic::AtomicI64},
-    usize,
 };
 
 use crate::core::worker::{Job, WalkWorker, WorkerResult};
@@ -28,7 +27,7 @@ impl Multithreaded {
     pub fn walk(&self, root: PathBuf) -> anyhow::Result<()> {
         let mut total_blocks: u64 = 0;
         // Global work queue
-        let injector = Arc::new(Injector::<Job>::new());
+        let global_injector = Arc::new(Injector::<Job>::new());
 
         // Create internal workers
         let mut workers: Vec<Worker<Job>> = Vec::with_capacity(self.num_threads);
@@ -45,16 +44,16 @@ impl Multithreaded {
 
         let stealers = Arc::new(stealers);
 
-        let termination = Arc::new(AtomicI64::new(1));
+        let global_job_counter = Arc::new(AtomicI64::new(1));
 
-        // Seed global queue with root job
+        // Seed global queue with a root job
         let mut root_job = Job::new(root.clone(), None, 0, true);
         if let Ok(metadata) = root.symlink_metadata() {
             if metadata.is_file() {
                 root_job.is_dir = false;
             }
         }
-        injector.push(root_job);
+        global_injector.push(root_job);
 
         // Spawn workers
         let result = crossbeam_utils::thread::scope(|s| {
@@ -64,15 +63,17 @@ impl Multithreaded {
                     id,
                     worker,
                     stealers.clone(),
-                    injector.clone(),
+                    global_injector.clone(),
                     self.num_threads,
                     self.follow_symlinks,
                     self.max_depth,
                 );
-                let termination = termination.clone();
-                let worker_handle = s.spawn(move |_| walk_walker.run_loop(termination));
+                let gjc_clone = global_job_counter.clone();
+                let worker_handle = s
+                    .spawn(move |_| walk_walker.run_loop(gjc_clone));
                 handles.push(worker_handle);
             }
+
             // Wait for all workers and collect errors
             for handle in handles {
                 match handle.join() {
