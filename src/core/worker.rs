@@ -8,6 +8,7 @@ use std::{
         Arc,
         atomic::{AtomicI64, Ordering},
     },
+    time::Duration,
 };
 
 /// A directory path with its depth relative to the root item
@@ -126,11 +127,14 @@ impl WalkWorker {
     fn steal_from_global(&self) -> Option<Job> {
         // Calculate a fair batch size based on queue length
         let batch_size = (self.injector.len() / self.num_workers)
-            .max(1)   // Always try to steal at least 1
+            .max(1) // Always try to steal at least 1
             .min(32); // Cap at 32 to avoid hogging
 
         loop {
-            match self.injector.steal_batch_with_limit_and_pop(&self.inner, batch_size) {
+            match self
+                .injector
+                .steal_batch_with_limit_and_pop(&self.inner, batch_size)
+            {
                 Steal::Success(job) => {
                     log::trace!("Worker {} stole batch from global queue", self.id);
                     return Some(job);
@@ -211,30 +215,33 @@ impl WalkWorker {
                     // No work found, enter an exponential backoff sequence
                     idle_cycles += 1;
                     match idle_cycles {
-                        // Phase 1: Light spinning (1-9 cycles)
-                        1..=9 => {
+                        // Phase 1: Light spinning (1-10 cycles)
+                        1..=10 => {
                             std::hint::spin_loop();
                         }
-                        // Phase 2: Yielding to scheduler (10-999 cycles)
-                        10..=999 => {
-                            std::thread::yield_now();
-                        }
-                        // Phase 3: Sync local work delta (at cycle 1000)
-                        1000 => {
+                        // Phase 3: Sync local work delta
+                        11 => {
                             if self.local_work_delta != 0 {
-                                global_job_counter.fetch_add(
-                                    self.local_work_delta,
-                                    Ordering::AcqRel
-                                );
+                                global_job_counter
+                                    .fetch_add(self.local_work_delta, Ordering::AcqRel);
                                 self.local_work_delta = 0;
                             }
-                            std::thread::yield_now();
                         }
-                        // Phase 4: Keep waiting (1001-4999 cycles)
-                        1001..=4999 => {
-                            std::thread::yield_now();
+                        12..=50 => {
+                            if idle_cycles % 10 == 0 {
+                                std::thread::yield_now();
+                            }
+                            if self.should_terminate(&global_job_counter) {
+                                log::info!(
+                                    "Worker {} terminating: dirs={}, files={}, errors={}",
+                                    self.id,
+                                    self.dirs_processed,
+                                    self.files_processed,
+                                    self.errors_count
+                                );
+                                break;
+                            }
                         }
-                        // Phase 5: Final termination check (5000+ cycles)
                         _ => {
                             if self.should_terminate(&global_job_counter) {
                                 log::info!(
@@ -246,9 +253,8 @@ impl WalkWorker {
                                 );
                                 break;
                             }
-                            // Reset to stay in the synced phase
-                            idle_cycles = 1001;
-                            std::thread::yield_now();
+                            std::thread::sleep(Duration::from_micros(1));
+                            idle_cycles = 12;
                         }
                     }
                 }
@@ -261,7 +267,12 @@ impl WalkWorker {
         // Check max depth
         if let Some(max) = self.max_depth {
             if job.depth > max {
-                return Err(anyhow::anyhow!("Worker {} has reached max depth: {} > {}", self.id, job.depth, max));
+                return Err(anyhow::anyhow!(
+                    "Worker {} has reached max depth: {} > {}",
+                    self.id,
+                    job.depth,
+                    max
+                ));
             }
         }
 
@@ -271,7 +282,7 @@ impl WalkWorker {
         // Short path if the root path is a file
         if !job.is_dir {
             self.files_processed += 1;
-             return self.process_file(&job);
+            return self.process_file(&job);
         }
 
         // Read entries
@@ -299,7 +310,11 @@ impl WalkWorker {
                         }
                         Err(err) => {
                             self.errors_count += 1;
-                            log::error!("Worker {} failed to read directory entry, skipping: {}", self.id, err);
+                            log::error!(
+                                "Worker {} failed to read directory entry, skipping: {}",
+                                self.id,
+                                err
+                            );
                         }
                     }
                 }
@@ -307,13 +322,18 @@ impl WalkWorker {
                 anyhow::Ok(())
             }
             Err(err) => {
-                log::error!("Worker {} failed to open directory {}: {}", self.id, job.path.display(), err);
+                log::error!(
+                    "Worker {} failed to open directory {}: {}",
+                    self.id,
+                    job.path.display(),
+                    err
+                );
                 Err(err.into())
             }
         }
     }
 
-    fn process_file(&mut self, job: &Job) -> Result<(), anyhow::Error>{
+    fn process_file(&mut self, job: &Job) -> Result<(), anyhow::Error> {
         match job.path.symlink_metadata() {
             Ok(metadata) => {
                 if !is_special_file(&metadata.file_type()) {
