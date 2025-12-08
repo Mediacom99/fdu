@@ -7,6 +7,7 @@ use crate::core::worker::{Job, WalkWorker, WorkerResult};
 use anyhow::anyhow;
 use crossbeam_deque::{Injector, Stealer, Worker};
 use crossbeam_utils::thread::ScopedJoinHandle;
+use humansize::Kilo;
 
 pub struct Multithreaded {
     num_threads: usize,
@@ -36,7 +37,7 @@ impl Multithreaded {
 
         // Initialize internal workers and stealers
         for _ in 0..self.num_threads {
-            let worker = Worker::new_fifo();
+            let worker = Worker::new_lifo();
             let stealer = worker.stealer();
             workers.push(worker);
             stealers.push(stealer);
@@ -69,8 +70,7 @@ impl Multithreaded {
                     self.max_depth,
                 );
                 let gjc_clone = global_job_counter.clone();
-                let worker_handle = s
-                    .spawn(move |_| walk_walker.run_loop(gjc_clone));
+                let worker_handle = s.spawn(move |_| walk_walker.run_loop(gjc_clone));
                 handles.push(worker_handle);
             }
 
@@ -91,8 +91,8 @@ impl Multithreaded {
             }
         });
         println!(
-            "Total size: {}",
-            humansize::format_size(total_blocks * 512, humansize::DECIMAL)
+            "✅ Disk usage: {}",
+            humansize::format_size(total_blocks * 512, humansize::DECIMAL),
         );
         result.map_err(|e| anyhow!("Thread scope execution failed: {:?}", e))?;
         Ok(())

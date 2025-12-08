@@ -114,13 +114,13 @@ impl WalkWorker {
             return Some(job);
         }
 
-        // 2. Try stealing from the global queue with an adaptive batch size
-        if let Some(job) = self.steal_from_global() {
+        // 2. Try stealing from other workers
+        if let Some(job) = self.steal_from_victims() {
             return Some(job);
         }
 
-        // 3. Try stealing from other workers
-        self.steal_from_victims()
+        // 3. Try stealing from the global queue
+        self.steal_from_global()
     }
 
     /// Steal from the global queue with adaptive batching
@@ -228,6 +228,7 @@ impl WalkWorker {
                             }
                         }
                         12..=50 => {
+                            // Yield every 10 cycles
                             if idle_cycles % 10 == 0 {
                                 std::thread::yield_now();
                             }
@@ -253,7 +254,7 @@ impl WalkWorker {
                                 );
                                 break;
                             }
-                            std::thread::sleep(Duration::from_micros(1));
+                            std::thread::sleep(Duration::from_nanos(500));
                             idle_cycles = 12;
                         }
                     }
@@ -296,9 +297,9 @@ impl WalkWorker {
                                 let mut new_job =
                                     Job::new(entry.path(), parent, job.depth + 1, false);
                                 if ft.is_dir() {
-                                    // Send to global queue or batch and then send
+                                    // Send to local queue
                                     new_job.is_dir = true;
-                                    self.injector.push(new_job);
+                                    self.inner.push(new_job);
                                     self.local_work_delta += 1;
                                 } else {
                                     self.files_processed += 1;
@@ -310,7 +311,7 @@ impl WalkWorker {
                         }
                         Err(err) => {
                             self.errors_count += 1;
-                            log::error!(
+                            log::warn!(
                                 "Worker {} failed to read directory entry, skipping: {}",
                                 self.id,
                                 err
@@ -322,7 +323,7 @@ impl WalkWorker {
                 anyhow::Ok(())
             }
             Err(err) => {
-                log::error!(
+                log::warn!(
                     "Worker {} failed to open directory {}: {}",
                     self.id,
                     job.path.display(),
@@ -338,11 +339,17 @@ impl WalkWorker {
             Ok(metadata) => {
                 if !is_special_file(&metadata.file_type()) {
                     self.total_blocks += metadata.blocks();
+                } else {
+                    log::warn!(
+                        "Worker {} skipped special file: {}",
+                        self.id,
+                        job.path.display(),
+                    );
                 }
                 anyhow::Ok(())
             }
             Err(err) => {
-                log::error!(
+                log::warn!(
                     "Worker {} failed to read metadata for file: {}, error: {}",
                     self.id,
                     job.path.display(),
